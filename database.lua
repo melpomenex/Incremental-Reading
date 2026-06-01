@@ -4,6 +4,39 @@ local SQ3 = require("lua-ljsqlite3/init")
 local Util = require("ffi/util")
 
 local db_location = DataStorage:getSettingsDir() .. "/incremental_reading.sqlite3"
+
+local function serializeTable(val)
+    if type(val) == "table" then
+        local parts = {}
+        for k, v in pairs(val) do
+            table.insert(parts, string.format("%s=%s", k, tostring(v)))
+        end
+        return "TABLE:" .. table.concat(parts, ";")
+    end
+    return val
+end
+
+local function deserializeTable(val)
+    if type(val) == "string" and val:sub(1, 6) == "TABLE:" then
+        local t = {}
+        for pair in val:sub(7):gmatch("([^;]+)") do
+            local k, v = pair:match("([^=]+)=([^=]+)")
+            if k and v then
+                if tonumber(v) then
+                    t[k] = tonumber(v)
+                elseif v == "true" then
+                    t[k] = true
+                elseif v == "false" then
+                    t[k] = false
+                else
+                    t[k] = v
+                end
+            end
+        end
+        return t
+    end
+    return val
+end
 local DB_SCHEMA_VERSION = 20260530
 
 local UFACTOR = {
@@ -85,6 +118,10 @@ function DB:init()
         self:seedMatrix(conn)
         conn:exec(string.format("PRAGMA user_version=%d;", DB_SCHEMA_VERSION))
     end
+    -- Migrate NULL/empty/broken dates (broken on Android by SQLite's localtime modifier) to Lua UTC now
+    local now = os.date("!%Y-%m-%d %H:%M:%S")
+    conn:exec(string.format("UPDATE cards SET next_review = '%s' WHERE next_review IS NULL OR next_review = '' OR next_review LIKE '%%localtime%%';", now))
+    conn:exec(string.format("UPDATE cards SET created_at = '%s' WHERE created_at IS NULL OR created_at = '' OR created_at LIKE '%%localtime%%';", now))
     conn:close()
 end
 
@@ -103,10 +140,12 @@ end
 function DB:insertCard(text, book_title, file_path, xpointer, page, chapter)
     local conn = openDB()
     local stmt = conn:prepare([[
-        INSERT INTO cards (text, book_title, file_path, xpointer, page, chapter)
-        VALUES (?, ?, ?, ?, ?, ?);
+        INSERT INTO cards (text, book_title, file_path, xpointer, page, chapter, created_at, next_review)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
     ]])
-    stmt:bind(text, book_title, file_path, xpointer, page, chapter)
+    local now = os.date("!%Y-%m-%d %H:%M:%S")
+    local ser_xpointer = serializeTable(xpointer)
+    stmt:bind(text, book_title, file_path, ser_xpointer, page, chapter, now, now)
     stmt:step()
     stmt:close()
     conn:close()
@@ -118,23 +157,24 @@ function DB:getDueCards()
         SELECT id, text, book_title, file_path, xpointer, page, chapter,
                stability, difficulty, repetition, next_review
         FROM cards
-        WHERE next_review <= datetime('now','localtime') AND suspended = 0
+        WHERE next_review <= ? AND suspended = 0
         ORDER BY next_review ASC;
     ]])
+    stmt:bind(os.date("!%Y-%m-%d %H:%M:%S"))
     local results = {}
     local row = stmt:step()
     while row do
         table.insert(results, {
-            id          = row[1],
+            id          = tonumber(row[1]),
             text        = row[2],
             book_title  = row[3],
             file_path   = row[4],
-            xpointer    = row[5],
-            page        = row[6],
+            xpointer    = deserializeTable(row[5]),
+            page        = tonumber(row[6]),
             chapter     = row[7],
-            stability   = row[8],
-            difficulty  = row[9],
-            repetition  = row[10],
+            stability   = tonumber(row[8]) or 2.0,
+            difficulty  = tonumber(row[9]) or 0.5,
+            repetition  = tonumber(row[10]) or 1,
             next_review = row[11],
         })
         row = stmt:step()
@@ -168,12 +208,28 @@ function DB:updateCardSRS(card_id, stability, difficulty, repetition, next_revie
     conn:close()
 end
 
+function DB:updateCardText(card_id, new_text)
+    local conn = openDB()
+    local stmt = conn:prepare([[
+        UPDATE cards SET text = ?
+        WHERE id = ?;
+    ]])
+    stmt:bind(new_text, card_id)
+    stmt:step()
+    stmt:close()
+    conn:close()
+end
+
 function DB:getDueCount()
     local conn = openDB()
-    local count = tonumber(conn:rowexec([[
+    local stmt = conn:prepare([[
         SELECT COUNT(*) FROM cards
-        WHERE next_review <= datetime('now','localtime') AND suspended = 0;
-    ]]))
+        WHERE next_review <= ? AND suspended = 0;
+    ]])
+    stmt:bind(os.date("!%Y-%m-%d %H:%M:%S"))
+    local row = stmt:step()
+    local count = row and tonumber(row[1]) or 0
+    stmt:close()
     conn:close()
     return count or 0
 end
@@ -197,16 +253,16 @@ function DB:getAllCards()
     local row = stmt:step()
     while row do
         table.insert(results, {
-            id          = row[1],
+            id          = tonumber(row[1]),
             text        = row[2],
             book_title  = row[3],
             file_path   = row[4],
-            xpointer    = row[5],
-            page        = row[6],
+            xpointer    = deserializeTable(row[5]),
+            page        = tonumber(row[6]),
             chapter     = row[7],
-            stability   = row[8],
-            difficulty  = row[9],
-            repetition  = row[10],
+            stability   = tonumber(row[8]) or 2.0,
+            difficulty  = tonumber(row[9]) or 0.5,
+            repetition  = tonumber(row[10]) or 1,
             next_review = row[11],
         })
         row = stmt:step()
@@ -246,11 +302,12 @@ end
 
 function DB:isDuplicate(text, file_path, xpointer)
     local conn = openDB()
+    local ser_xpointer = serializeTable(xpointer)
     local stmt
-    if xpointer then
+    if ser_xpointer then
         stmt = conn:prepare(
             "SELECT COUNT(*) FROM cards WHERE text = ? AND file_path = ? AND xpointer = ?;")
-        stmt:bind(text, file_path, xpointer)
+        stmt:bind(text, file_path, ser_xpointer)
     else
         stmt = conn:prepare(
             "SELECT COUNT(*) FROM cards WHERE text = ? AND file_path = ?;")
@@ -277,10 +334,14 @@ end
 function DB:getStatistics()
     local conn = openDB()
     local total_cards = tonumber(conn:rowexec("SELECT COUNT(*) FROM cards;")) or 0
-    local due_today = tonumber(conn:rowexec([[
+    local stmt = conn:prepare([[
         SELECT COUNT(*) FROM cards
-        WHERE next_review <= datetime('now','localtime') AND suspended = 0;
-    ]])) or 0
+        WHERE next_review <= ? AND suspended = 0;
+    ]])
+    stmt:bind(os.date("!%Y-%m-%d %H:%M:%S"))
+    local row = stmt:step()
+    local due_today = row and tonumber(row[1]) or 0
+    stmt:close()
     local total_reviews = tonumber(conn:rowexec("SELECT COUNT(*) FROM reviews;")) or 0
     local avg_interval = tonumber(conn:rowexec([[
         SELECT COALESCE(AVG(stability), 0) FROM cards WHERE stability > 0;

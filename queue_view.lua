@@ -23,6 +23,30 @@ local T = require("ffi/util").template
 
 local db = require("database")
 local SM20Engine = require("srs_engine")
+local InputDialog = require("ui/widget/inputdialog")
+
+local function hasCloze(text)
+    if not text then return false end
+    return text:find("{{.-}}") ~= nil
+end
+
+local function hideCloze(text)
+    if not text then return "" end
+    local hidden = text:gsub("{{(.-)}}", function(match)
+        local inner = match:match("^%d+::(.*)$") or match
+        return "[...]"
+    end)
+    return hidden
+end
+
+local function revealCloze(text)
+    if not text then return "" end
+    local revealed = text:gsub("{{(.-)}}", function(match)
+        local inner = match:match("^%d+::(.*)$") or match
+        return "== " .. inner .. " =="
+    end)
+    return revealed
+end
 
 local QueueView = InputContainer:extend{
     covers_fullscreen = true,
@@ -30,11 +54,14 @@ local QueueView = InputContainer:extend{
 
 function QueueView:init()
     self.dimen = Geom:new{
+        x = 0,
+        y = 0,
         w = Screen:getWidth(),
         h = Screen:getHeight(),
     }
 
     self.current_idx = 1
+    self.cloze_revealed = false
     self.cards = self.cards or {}
     self.total_cards = #self.cards
     self.reviewed_count = 0
@@ -84,8 +111,8 @@ function QueueView:_buildUI()
 
     self.title_bar = TitleBar:new{
         width = self.dimen.w,
-        title = card.book_title,
-        subtitle = card.chapter ~= "" and card.chapter or nil,
+        title = card.book_title or "",
+        subtitle = (card.chapter and card.chapter ~= "") and card.chapter or nil,
         close_callback = function()
             self:onClose()
         end,
@@ -102,9 +129,20 @@ function QueueView:_buildUI()
         - Size.padding.default * 4
         - Size.item.height_default * 2
 
+    local card_text = card.text or ""
+    local card_has_cloze = hasCloze(card_text)
+    local text_to_display = card_text
+    if card_has_cloze then
+        if self.cloze_revealed then
+            text_to_display = revealCloze(card_text)
+        else
+            text_to_display = hideCloze(card_text)
+        end
+    end
+
     self.text_widget = TextBoxWidget:new{
-        text = card.text,
-        face = Font:getFace("x_textinfo"),
+        text = text_to_display,
+        face = Font:getFace("infofont"),
         width = self.dimen.w - Size.padding.fullscreen * 2,
         height = content_height,
         scroll = true,
@@ -117,43 +155,71 @@ function QueueView:_buildUI()
         face = Font:getFace("infofont"),
     }
 
-    local grade_buttons = {
-        {
+    local bottom_buttons
+    if card_has_cloze and not self.cloze_revealed then
+        bottom_buttons = {
             {
-                text = _("Again"),
-                callback = function()
-                    self:onGrade("again")
-                end,
-            },
+                {
+                    text = _("Show Answer"),
+                    callback = function()
+                        self.cloze_revealed = true
+                        self:_buildUI()
+                        UIManager:setDirty(self, "full")
+                    end,
+                },
+                {
+                    text = _("Edit"),
+                    callback = function()
+                        self:onEditCard()
+                    end,
+                },
+            }
+        }
+    else
+        bottom_buttons = {
             {
-                text = _("Hard"),
-                callback = function()
-                    self:onGrade("hard")
-                end,
-            },
-            {
-                text = _("Good"),
-                callback = function()
-                    self:onGrade("good")
-                end,
-            },
-            {
-                text = _("Easy"),
-                callback = function()
-                    self:onGrade("easy")
-                end,
-            },
-        },
-    }
+                {
+                    text = _("Again"),
+                    callback = function()
+                        self:onGrade("again")
+                    end,
+                },
+                {
+                    text = _("Hard"),
+                    callback = function()
+                        self:onGrade("hard")
+                    end,
+                },
+                {
+                    text = _("Good"),
+                    callback = function()
+                        self:onGrade("good")
+                    end,
+                },
+                {
+                    text = _("Easy"),
+                    callback = function()
+                        self:onGrade("easy")
+                    end,
+                },
+                {
+                    text = _("Edit"),
+                    callback = function()
+                        self:onEditCard()
+                    end,
+                },
+            }
+        }
+    end
 
     local button_table = ButtonTable:new{
         width = self.dimen.w,
-        buttons = grade_buttons,
+        buttons = bottom_buttons,
         show_parent = self,
     }
 
     local content = VerticalGroup:new{
-        align = "left",
+        align = "center",
         self.title_bar,
         self.progress_widget,
         self.text_widget,
@@ -176,43 +242,54 @@ function QueueView:_buildUI()
 end
 
 function QueueView:onGrade(grade_name)
-    local card = self.cards[self.current_idx]
-    if not card then return true end
+    local ok, err = pcall(function()
+        local card = self.cards[self.current_idx]
+        if not card then return end
 
-    local result = SM20Engine:review(card, grade_name, self.interval_matrix, self.count_matrix)
-    SM20Engine:recordIntoMatrix(card, result, self.interval_matrix, self.count_matrix)
+        local result = SM20Engine:review(card, grade_name, self.interval_matrix, self.count_matrix)
+        SM20Engine:recordIntoMatrix(card, result, self.interval_matrix, self.count_matrix)
 
-    local next_review_date = os.date("!%Y-%m-%d %H:%M:%S",
-        os.time() + result.next_review_offset_days * 86400)
+        local next_review_date = os.date("!%Y-%m-%d %H:%M:%S",
+            math.floor(os.time() + result.next_review_offset_days * 86400))
 
-    table.insert(self.pending_reviews, {
-        card_id          = result.card_id,
-        grade            = result.grade,
-        prev_stability   = result.prev_stability,
-        new_stability    = result.new_stability,
-        prev_interval    = result.prev_interval,
-        new_interval     = result.new_interval,
-        elapsed_days     = result.elapsed_days,
-        new_difficulty   = result.new_difficulty,
-        new_repetition   = result.new_repetition,
-        next_review_date = next_review_date,
-    })
+        table.insert(self.pending_reviews, {
+            card_id          = result.card_id,
+            grade            = result.grade,
+            prev_stability   = result.prev_stability,
+            new_stability    = result.new_stability,
+            prev_interval    = result.prev_interval,
+            new_interval     = result.new_interval,
+            elapsed_days     = result.elapsed_days,
+            new_difficulty   = result.new_difficulty,
+            new_repetition   = result.new_repetition,
+            next_review_date = next_review_date,
+        })
 
-    self.reviewed_count = self.reviewed_count + 1
+        self.reviewed_count = self.reviewed_count + 1
 
-    -- Batch flush every 10 reviews
-    if #self.pending_reviews >= 10 then
-        db:flushReviews(self.pending_reviews)
-        self.pending_reviews = {}
+        -- Batch flush every 10 reviews
+        if #self.pending_reviews >= 10 then
+            db:flushReviews(self.pending_reviews)
+            self.pending_reviews = {}
+        end
+
+        self:_advance()
+    end)
+
+    if not ok then
+        local ConfirmBox = require("ui/widget/confirmbox")
+        UIManager:show(ConfirmBox:new{
+            text = "Grade Error: " .. tostring(err),
+            ok_text = _("Close"),
+        })
     end
-
-    self:_advance()
     return true
 end
 
 function QueueView:_advance()
     table.insert(self.prev_cards, self.current_idx)
     self.current_idx = self.current_idx + 1
+    self.cloze_revealed = false
 
     if self.current_idx > self.total_cards then
         self:_flushAndClose()
@@ -229,6 +306,7 @@ end
 function QueueView:_goBack()
     if #self.prev_cards == 0 then return end
     self.current_idx = table.remove(self.prev_cards)
+    self.cloze_revealed = false
     self:_buildUI()
     UIManager:setDirty(self, "full")
 end
@@ -304,6 +382,59 @@ end
 
 function QueueView:onCloseWidget()
     UIManager:setDirty(nil, "ui")
+end
+
+function QueueView:onEditCard()
+    local card = self.cards[self.current_idx]
+    if not card then return end
+
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Edit Card Text"),
+        input = card.text,
+        input_hint = _("Use {{phrase}} for cloze deletion"),
+        cursor_at_end = true,
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("Save"),
+                    is_enter_default = true,
+                    callback = function()
+                        local new_text = dialog:getInputText()
+                        UIManager:close(dialog)
+                        if new_text and new_text ~= "" and new_text ~= card.text then
+                            db:updateCardText(card.id, new_text)
+                            card.text = new_text
+                            self:_buildUI()
+                            UIManager:setDirty(self, "full")
+                        end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function QueueView:paintTo(bb, x, y)
+    local ok, err = pcall(function()
+        InputContainer.paintTo(self, bb, x, y)
+    end)
+    if not ok then
+        local ConfirmBox = require("ui/widget/confirmbox")
+        UIManager:show(ConfirmBox:new{
+            text = "Paint Error: " .. tostring(err),
+            ok_text = _("Close"),
+        })
+    end
 end
 
 return QueueView

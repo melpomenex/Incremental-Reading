@@ -17,6 +17,9 @@ local IncReading = WidgetContainer:extend{
 function IncReading:init()
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
+end
+
+function IncReading:onReaderReady()
     if self.ui.highlight then
         self:registerHighlightButton()
     end
@@ -74,51 +77,81 @@ function IncReading:registerHighlightButton()
 end
 
 function IncReading:onExportHighlight(highlight)
-    local selected_text = highlight.selected_text
-    if not selected_text or not selected_text.text then
-        return
-    end
-    local text = selected_text.text
-    local file_path = self.ui.document.file
-    local book_title = self.ui.document:hasProp("title") and self.ui.document:getProp("title") or ""
-    if book_title == "" then
-        local util = require("ffi/util")
-        book_title = util.basename(file_path)
-    end
-    local xpointer = nil
-    local page = nil
-    local chapter = ""
-    if selected_text.pos0 then
-        xpointer = selected_text.pos0
-    end
-    if self.ui.document.info and self.ui.document.info.has_pages then
-        page = self.ui.document:getCurrentPage()
-    end
-    if self.ui.toc then
-        chapter = self.ui.toc:getTocTitleByPage(selected_text.pos0 or self.ui.document:getCurrentPage())
-    end
+    local ok, err = pcall(function()
+        highlight:highlightFromHoldPos()
+        local selected_text = highlight.selected_text
+        if not selected_text or not selected_text.text then
+            local InfoMessage = require("ui/widget/infomessage")
+            UIManager:show(InfoMessage:new{text = _("Error: No selected text found!")})
+            return
+        end
+        
+        local util = require("util")
+        local text = util.cleanupSelectedText(selected_text.text)
+        local file_path = self.ui.document.file
+        
+        local ffiUtil = require("ffi/util")
+        local props = self.ui.document:getProps()
+        local book_title = props and props.title or ""
+        if book_title == "" then
+            book_title = ffiUtil.basename(file_path)
+        end
+        
+        local xpointer = nil
+        local page = nil
+        local chapter = ""
+        if selected_text.pos0 then
+            xpointer = selected_text.pos0
+        end
+        if self.ui.document.info and self.ui.document.info.has_pages then
+            page = self.ui.document:getCurrentPage()
+        end
+        if self.ui.toc then
+            chapter = self.ui.toc:getTocTitleByPage(selected_text.pos0 or self.ui.document:getCurrentPage())
+        end
 
-    if db:isDuplicate(text, file_path, xpointer) then
-        Notification:notify(_("Already in queue"))
-        return
+        if db:isDuplicate(text, file_path, xpointer) then
+            Notification:notify(_("Already in queue"))
+            highlight:onClose()
+            return
+        end
+        db:insertCard(text, book_title, file_path, xpointer, page, chapter)
+        Notification:notify(_("Added to review queue"))
+        highlight:onClose()
+    end)
+    
+    if not ok then
+        local ConfirmBox = require("ui/widget/confirmbox")
+        UIManager:show(ConfirmBox:new{
+            text = "Export Error: " .. tostring(err),
+            ok_text = _("Close"),
+        })
     end
-    db:insertCard(text, book_title, file_path, xpointer, page, chapter)
-    Notification:notify(_("Added to review queue"))
 end
 
 function IncReading:onOpenReviewQueue()
-    local cards = db:getDueCards()
-    if #cards == 0 then
-        UIManager:show(InfoMessage:new{
-            text = _("No cards due for review. Come back later!"),
+    local ok, err = pcall(function()
+        local cards = db:getDueCards()
+        if #cards == 0 then
+            UIManager:show(InfoMessage:new{
+                text = _("No cards due for review. Come back later!"),
+            })
+            return
+        end
+        local view = QueueView:new{
+            cards = cards,
+            plugin = self,
+        }
+        UIManager:show(view)
+    end)
+    
+    if not ok then
+        local ConfirmBox = require("ui/widget/confirmbox")
+        UIManager:show(ConfirmBox:new{
+            text = "Review Error: " .. tostring(err),
+            ok_text = _("Close"),
         })
-        return
     end
-    local view = QueueView:new{
-        cards = cards,
-        plugin = self,
-    }
-    UIManager:show(view)
 end
 
 function IncReading:onBrowseCards()
