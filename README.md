@@ -12,6 +12,8 @@ Uses the **SM-20 algorithm with Bayesian smoothing** for interval scheduling —
 4. The SM-20 engine schedules the next review based on your grading history
 5. Tap the back arrow on any card to jump to its location in the source document
 
+![Review queue](review_queue.png)
+
 ## Menu
 
 Accessed under **More tools → Review Queue (N)** where N is the number of due cards.

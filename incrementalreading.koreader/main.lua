@@ -31,7 +31,7 @@ function IncReading:addToMainMenu(menu_items)
             local count = db:getDueCount()
             return T(_("Review Queue (%1)"), count)
         end,
-        sorting_hint = "more_tools",
+        sorting_hint = self.ui.document and "typeset" or "more_tools",
         callback = function()
             self:onOpenReviewQueue()
         end,
