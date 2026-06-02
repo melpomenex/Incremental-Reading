@@ -12,7 +12,7 @@ Uses the **SM-20 algorithm with Bayesian smoothing** for interval scheduling —
    - **Kobo**: `.adds/koreader/plugins/`
    - **Android**: `Android/data/org.koreader.koreader/files/plugins/`
    - **Desktop (Linux/Mac/Windows)**: `<koreader_install>/plugins/`
-3. Restart KOReader — the plugin appears under **More tools → Review Queue**
+3. Restart KOReader — the plugin appears under the **Highlights** button in the **Documents** tab while reading a book
 
 Or from a terminal:
 
