@@ -7,7 +7,7 @@ Uses the **SM-20 algorithm with Bayesian smoothing** for interval scheduling —
 ## Install
 
 1. Download or clone this repository
-2. Copy the `incrementalreading.koreader` folder into your KOReader plugins directory:
+2. Copy the `incrementalreading.koplugin` folder into your KOReader plugins directory:
    - **Kindle**: `koreader/plugins/`
    - **Kobo**: `.adds/koreader/plugins/`
    - **Android**: `Android/data/org.koreader.koreader/files/plugins/`
