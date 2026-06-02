@@ -4,6 +4,23 @@ A spaced repetition plugin for KOReader. Export highlighted passages from e-book
 
 Uses the **SM-20 algorithm with Bayesian smoothing** for interval scheduling — the same family of algorithms used by modern Anki variants.
 
+## Install
+
+1. Download or clone this repository
+2. Copy the `incrementalreading.koreader` folder into your KOReader plugins directory:
+   - **Kindle**: `koreader/plugins/`
+   - **Kobo**: `.adds/koreader/plugins/`
+   - **Android**: `Android/data/org.koreader.koreader/files/plugins/`
+   - **Desktop (Linux/Mac/Windows)**: `<koreader_install>/plugins/`
+3. Restart KOReader — the plugin appears under **More tools → Review Queue**
+
+Or from a terminal:
+
+```sh
+git clone https://github.com/melpomenex/Incremental-Reading.git
+cp -r Incremental-Reading/incrementalreading.koreader <your_plugins_dir>/
+```
+
 ## How it works
 
 1. **Highlight** a passage in any document and tap **"Export to SRS"** in the highlight dialog
