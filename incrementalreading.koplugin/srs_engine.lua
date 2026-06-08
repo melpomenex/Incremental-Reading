@@ -234,10 +234,17 @@ end
 -------------------------------------------------------------------------------
 
 local GRADE_QUALITY = {
-    again = 0.0,
-    hard  = 0.3,
-    good  = 0.6,
-    easy  = 0.9,
+    again = 0.05,
+    hard  = 0.60,
+    good  = 0.78,
+    easy  = 0.92,
+}
+
+local SUCCESS_MULTIPLIER = {
+    again = 1.0,
+    hard  = 0.85,
+    good  = 1.0,
+    easy  = 1.15,
 }
 
 -------------------------------------------------------------------------------
@@ -253,44 +260,43 @@ function SM20Engine:initCard()
 end
 
 function SM20Engine:review(card, grade_name, interval_matrix, count_matrix)
-    local quality = GRADE_QUALITY[grade_name] or 0.6
+    local quality = GRADE_QUALITY[grade_name] or 0.78
     local stability = stability_pretransform(card.stability)
     local difficulty = card.difficulty
     local repetition = card.repetition
 
-    local d_idx = clamp(difficulty_to_index(difficulty) - 1, 0, 19)
-    local s_idx = clamp(stability_to_index(stability) - 1, 0, 19)
-    local r_idx = clamp(repetition - 1, 0, 19)
+    local new_stability
+    local new_difficulty = clamp(difficulty + (0.7 - quality) * 0.18, 0.0, 1.0)
+    local new_repetition
 
-    local rep_frac = repetition_to_fraction(repetition)
-    local stab_xform = stability_to_transformed(stability_to_index(stability))
-    local diff_frac = difficulty_to_fraction(difficulty_to_index(difficulty))
-
-    local sinc = interval_v2(rep_frac, stab_xform, diff_frac)
-
-    if interval_matrix and count_matrix then
-        local target_flat = matrix_flat_index(r_idx, s_idx, d_idx) + 1
-        local target_count = count_matrix[target_flat] or 0
-        if target_count > 0 then
-            sinc = bayesian_smooth(r_idx, s_idx, d_idx, interval_matrix, count_matrix)
-        end
-    end
-
-    local new_stability = stability * sinc
-    new_stability = max(1.0, min(STABILITY_MAX, new_stability))
-
-    -- Adjust difficulty based on quality
-    local new_difficulty = difficulty
-    if quality < 0.3 then
-        new_difficulty = min(1.0, difficulty + 0.05)
-    elseif quality > 0.7 then
-        new_difficulty = max(0.0, difficulty - 0.02)
-    end
-
-    local new_repetition = repetition + 1
-    if quality < 0.2 then
+    if grade_name == "again" then
         new_repetition = 1
-        new_stability = max(1.0, stability * 0.5)
+        local decayed = max(0.5, stability * 0.35)
+        new_stability = clamp(decayed / 1.15, 0.5, 3.0)
+    else
+        new_repetition = clamp(repetition + 1, 1, 20)
+
+        local d_idx = clamp(difficulty_to_index(difficulty) - 1, 0, 19)
+        local s_idx = clamp(stability_to_index(stability) - 1, 0, 19)
+        local r_idx = clamp(repetition - 1, 0, 19)
+
+        local rep_frac = repetition_to_fraction(repetition)
+        local stab_xform = stability_to_transformed(stability_to_index(stability))
+        local diff_frac = difficulty_to_fraction(difficulty_to_index(difficulty))
+
+        local sinc = interval_v2(rep_frac, stab_xform, diff_frac)
+
+        if interval_matrix and count_matrix then
+            local target_flat = matrix_flat_index(r_idx, s_idx, d_idx) + 1
+            local target_count = count_matrix[target_flat] or 0
+            if target_count > 0 then
+                sinc = bayesian_smooth(r_idx, s_idx, d_idx, interval_matrix, count_matrix)
+            end
+        end
+
+        local base_stability = stability * sinc
+        local mult = SUCCESS_MULTIPLIER[grade_name] or 1.0
+        new_stability = clamp(base_stability * mult, 1.0, STABILITY_MAX)
     end
 
     local new_interval = new_stability
