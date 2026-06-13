@@ -8,6 +8,7 @@ local T = require("ffi/util").template
 
 local db = require("database")
 local QueueView = require("queue_view")
+local SM20Engine = require("srs_engine")
 
 local IncReading = WidgetContainer:extend{
     name = "incremental_reading",
@@ -156,60 +157,183 @@ end
 
 function IncReading:onBrowseCards()
     local Menu = require("ui/widget/menu")
-    local cards = db:getAllCards()
-    local item_table = {}
-    for _, card in ipairs(cards) do
-        table.insert(item_table, {
-            text = card.text:sub(1, 80) .. (card.text:len() > 80 and "…" or ""),
-            mandatory = card.book_title,
-            card = card,
-        })
+    local Screen = require("device").screen
+
+    local function build_items()
+        local cards = db:getAllCards()
+        local items = {}
+        for _, card in ipairs(cards) do
+            local preview = card.text:gsub("%s+", " "):sub(1, 80)
+            if card.text:len() > 80 then preview = preview .. "…" end
+            local badge
+            if card.suspended then
+                badge = _("suspended")
+            else
+                badge = SM20Engine.formatInterval(card.stability)
+            end
+            table.insert(items, {
+                text = preview,
+                mandatory = badge,
+                card = card,
+            })
+        end
+        return items
     end
+
     local menu = Menu:new{
         title = _("All cards"),
-        item_table = item_table,
+        item_table = build_items(),
         is_borderless = true,
         is_popout = false,
-        width = require("device").screen:getWidth(),
-        height = require("device").screen:getHeight(),
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
         covers_fullscreen = true,
     }
-    function menu:onMenuSelect(item)
-        local ConfirmBox = require("ui/widget/confirmbox")
-        UIManager:show(ConfirmBox:new{
-            text = item.card.text,
-            ok_text = _("Delete"),
-            ok_callback = function()
-                db:deleteCard(item.card.id)
-                menu:switchItemTable(menu.title, {})
-                local updated = db:getAllCards()
-                local new_items = {}
-                for _, c in ipairs(updated) do
-                    table.insert(new_items, {
-                        text = c.text:sub(1, 80) .. (c.text:len() > 80 and "…" or ""),
-                        mandatory = c.book_title,
-                        card = c,
-                    })
-                end
-                menu:switchItemTable(menu.title, new_items)
-            end,
-            cancel_text = _("Close"),
-        })
+
+    local function refresh()
+        menu:switchItemTable(menu.title, build_items())
     end
+
+    function menu:onMenuSelect(item)
+        local card = item.card
+        local ButtonDialogTitle = require("ui/widget/buttondialogtitle")
+        local dialog
+        dialog = ButtonDialogTitle:new{
+            title = card.text,
+            title_align = "center",
+            buttons = {
+                {
+                    {
+                        text = _("Open in book"),
+                        callback = function()
+                            UIManager:close(dialog)
+                            UIManager:close(menu)
+                            IncReading:_jumpToCard(card)
+                        end,
+                    },
+                    {
+                        text = _("Edit"),
+                        callback = function()
+                            UIManager:close(dialog)
+                            IncReading:_editCardText(card, function()
+                                refresh()
+                            end)
+                        end,
+                    },
+                },
+                {
+                    {
+                        text = card.suspended and _("Unsuspend") or _("Suspend"),
+                        callback = function()
+                            db:setCardSuspended(card.id, not card.suspended)
+                            UIManager:close(dialog)
+                            refresh()
+                        end,
+                    },
+                    {
+                        text = _("Delete"),
+                        callback = function()
+                            db:deleteCard(card.id)
+                            UIManager:close(dialog)
+                            local Notification = require("ui/widget/notification")
+                            Notification:notify(_("Card deleted"))
+                            refresh()
+                        end,
+                    },
+                },
+                {
+                    {
+                        text = _("Close"),
+                        callback = function()
+                            UIManager:close(dialog)
+                        end,
+                    },
+                },
+            },
+        }
+        UIManager:show(dialog)
+    end
+
     UIManager:show(menu)
+end
+
+function IncReading:_editCardText(card, on_saved)
+    local InputDialog = require("ui/widget/inputdialog")
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Edit Card Text"),
+        input = card.text,
+        input_hint = _("Use {{phrase}} for cloze deletion"),
+        cursor_at_end = true,
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("Save"),
+                    is_enter_default = true,
+                    callback = function()
+                        local new_text = dialog:getInputText()
+                        UIManager:close(dialog)
+                        if new_text and new_text ~= "" and new_text ~= card.text then
+                            db:updateCardText(card.id, new_text)
+                            card.text = new_text
+                            if on_saved then on_saved() end
+                            local Notification = require("ui/widget/notification")
+                            Notification:notify(_("Card updated"))
+                        end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function IncReading:_jumpToCard(card)
+    if not card.file_path or card.file_path == "" then
+        UIManager:show(InfoMessage:new{ text = _("Source document not available.") })
+        return
+    end
+    local ui = self.ui
+    if not ui then return end
+    local Event = require("ui/event")
+    if card.file_path ~= ui.document.file then
+        ui:switchDocument(card.file_path)
+    end
+    if card.xpointer then
+        ui:handleEvent(Event:new("GotoXPointer", card.xpointer, card.xpointer))
+    elseif card.page then
+        ui:handleEvent(Event:new("GotoPage", card.page))
+    end
 end
 
 function IncReading:onShowStatistics()
     local KeyValuePage = require("ui/widget/keyvaluepage")
     local stats = db:getStatistics()
+    local retention_pct = math.floor((stats.retention or 0) * 100 + 0.5)
     UIManager:show(KeyValuePage:new{
         title = _("SRS Statistics"),
         kv_pairs = {
             { _("Total cards"), tostring(stats.total_cards) },
-            { _("Cards due today"), tostring(stats.due_today) },
+            { _("Mature cards (≥ 21d)"), tostring(stats.mature_cards or 0) },
+            { _("Current streak (days)"), tostring(stats.streak or 0) },
+            { "--", "--" },
+            { _("Due now"), tostring(stats.due_today) },
+            { _("Due in 24h"), tostring(stats.due_24h or 0) },
+            { _("Due this week"), tostring(stats.due_week or 0) },
+            { "--", "--" },
             { _("Total reviews"), tostring(stats.total_reviews) },
-            { _("Average interval (days)"), string.format("%.1f", stats.avg_interval) },
+            { _("Retention"), string.format("%d%%  (%d remembered)", retention_pct, math.floor((stats.retention or 0) * (stats.total_reviews or 0) + 0.5)) },
+            { _("Avg. interval"), SM20Engine.formatInterval(stats.avg_interval) },
         },
+        single_page = true,
     })
 end
 

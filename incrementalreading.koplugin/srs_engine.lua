@@ -315,6 +315,36 @@ function SM20Engine:review(card, grade_name, interval_matrix, count_matrix)
     }
 end
 
+-------------------------------------------------------------------------------
+-- Formatting & preview
+-------------------------------------------------------------------------------
+
+-- Compact human-readable interval, e.g. "10m", "5h", "3d", "2w", "1mo", "1y".
+function SM20Engine.formatInterval(days)
+    days = tonumber(days)
+    if days == nil or days ~= days then return "?" end -- NaN guard
+    if days < 0 then days = 0 end
+    if days < 1 / 60 then return "<1m" end
+    if days < 1 then
+        local hours = math.floor(days * 24 + 0.5)
+        if hours < 1 then return "<1h" end
+        return hours .. "h"
+    end
+    if days < 30 then
+        return math.floor(days + 0.5) .. "d"
+    end
+    if days < 365 then
+        return math.floor(days / 30 + 0.5) .. "mo"
+    end
+    return string.format("%.1fy", days / 365)
+end
+
+-- Read-only preview: returns the same table as review() but never persists.
+-- Used to show predicted intervals on grade buttons.
+function SM20Engine:preview(card, grade_name, interval_matrix, count_matrix)
+    return self:review(card, grade_name, interval_matrix, count_matrix)
+end
+
 function SM20Engine:recordIntoMatrix(card, result, interval_matrix, count_matrix)
     if not interval_matrix or not count_matrix then return end
 

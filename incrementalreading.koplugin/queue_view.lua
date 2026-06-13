@@ -2,13 +2,11 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local VerticalGroup = require("ui/widget/verticalgroup")
-local HorizontalGroup = require("ui/widget/horizontalgroup")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local BottomContainer = require("ui/widget/container/bottomcontainer")
 local TitleBar = require("ui/widget/titlebar")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local ButtonTable = require("ui/widget/buttontable")
-local Button = require("ui/widget/button")
 local TextWidget = require("ui/widget/textwidget")
 local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
@@ -18,12 +16,43 @@ local Device = require("device")
 local Font = require("ui/font")
 local Size = require("ui/size")
 local GestureRange = require("ui/gesturerange")
+local Blitbuffer = require("ffi/blitbuffer")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
 local db = require("database")
 local SM20Engine = require("srs_engine")
-local InputDialog = require("ui/widget/inputdialog")
+
+-- Defensive requires: if any of these widgets are absent on an older/newer
+-- KOReader build, the plugin must still load. Each is checked before use.
+local has_progresswidget, ProgressWidget = pcall(require, "ui/widget/progresswidget")
+local has_keyvaluepage,  KeyValuePage  = pcall(require, "ui/widget/keyvaluepage")
+local has_inputdialog,   InputDialog   = pcall(require, "ui/widget/inputdialog")
+
+-- Border colors for the four grade buttons. ColorRGB32 is tried first
+-- (color screens); if it's unavailable or errors we fall back to distinct
+-- grayscale constants so e-ink devices still get visual hierarchy.
+local function gradeColor(r, g, b, fallback)
+    if Blitbuffer and Blitbuffer.ColorRGB32 then
+        local ok, color = pcall(Blitbuffer.ColorRGB32, r, g, b, 0xFF)
+        if ok and color then return color end
+    end
+    return fallback
+end
+
+local GRADE_COLORS = {
+    again = gradeColor(0x8B, 0x2C, 0x2C, Blitbuffer.COLOR_BLACK),     -- dark red
+    hard  = gradeColor(0x8B, 0x5A, 0x2C, Blitbuffer.COLOR_DARK_GRAY), -- amber
+    good  = gradeColor(0x2C, 0x5A, 0x8B, Blitbuffer.COLOR_GRAY),      -- blue
+    easy  = gradeColor(0x2C, 0x7A, 0x4E, Blitbuffer.COLOR_LIGHT_GRAY),-- green
+}
+
+local GRADE_LABELS = {
+    again = _("Again"),
+    hard  = _("Hard"),
+    good  = _("Good"),
+    easy  = _("Easy"),
+}
 
 local function hasCloze(text)
     if not text then return false end
@@ -32,20 +61,18 @@ end
 
 local function hideCloze(text)
     if not text then return "" end
-    local hidden = text:gsub("{{(.-)}}", function(match)
+    return text:gsub("{{(.-)}}", function(match)
         local inner = match:match("^%d+::(.*)$") or match
         return "[...]"
     end)
-    return hidden
 end
 
 local function revealCloze(text)
     if not text then return "" end
-    local revealed = text:gsub("{{(.-)}}", function(match)
+    return text:gsub("{{(.-)}}", function(match)
         local inner = match:match("^%d+::(.*)$") or match
         return "== " .. inner .. " =="
     end)
-    return revealed
 end
 
 local QueueView = InputContainer:extend{
@@ -67,6 +94,7 @@ function QueueView:init()
     self.reviewed_count = 0
     self.pending_reviews = {}
     self.prev_cards = {}
+    self.grade_counts = { again = 0, hard = 0, good = 0, easy = 0 }
 
     self.interval_matrix, self.count_matrix = db:loadIntervalMatrix()
 
@@ -85,6 +113,23 @@ function QueueView:init()
     self:_buildUI()
 end
 
+-- Read-only SM-20 preview for each grade. Used to label buttons with the
+-- predicted next interval ("Again (1d)", "Good (3d)", etc).
+function QueueView:_computePreviews(card)
+    local out = {}
+    for _, grade in ipairs({ "again", "hard", "good", "easy" }) do
+        local ok, result = pcall(function()
+            return SM20Engine:preview(card, grade, self.interval_matrix, self.count_matrix)
+        end)
+        if ok and result then
+            out[grade] = SM20Engine.formatInterval(result.next_review_offset_days)
+        else
+            out[grade] = "?"
+        end
+    end
+    return out
+end
+
 function QueueView:_buildUI()
     local card = self.cards[self.current_idx]
     if not card then
@@ -92,7 +137,7 @@ function QueueView:_buildUI()
             height = self.dimen.h,
             padding = 0,
             bordersize = 0,
-            background = require("ffi/blitbuffer").COLOR_WHITE,
+            background = Blitbuffer.COLOR_WHITE,
             CenterContainer:new{
                 dimen = self.dimen,
                 VerticalGroup:new{
@@ -107,8 +152,7 @@ function QueueView:_buildUI()
         return
     end
 
-    local progress_text = T(_("Reviewed: %1/%2"), self.reviewed_count, self.total_cards)
-
+    -- 1. Title bar with chapter subtitle and back-arrow to source
     self.title_bar = TitleBar:new{
         width = self.dimen.w,
         title = card.book_title or "",
@@ -124,37 +168,51 @@ function QueueView:_buildUI()
         left_icon_hold_callback = false,
     }
 
-    local content_height = self.dimen.h
-        - self.title_bar:getHeight()
-        - Size.padding.default * 4
-        - Size.item.height_default * 2
+    -- 2. Progress bar (skipped if ProgressWidget is unavailable on this build)
+    local pct = self.total_cards > 0 and (self.reviewed_count / self.total_cards) or 0
+    if has_progresswidget then
+        self.progress_bar = ProgressWidget:new{
+            width = self.dimen.w - Size.padding.fullscreen * 2,
+            height = Size.padding.default,
+            percentage = pct,
+            margin_h = 0,
+            margin_v = Size.padding.small,
+            radius = 0,
+        }
+    else
+        self.progress_bar = TextWidget:new{
+            text = string.rep("=", math.floor(pct * 20)) .. string.rep(" ", 20 - math.floor(pct * 20)),
+            face = Font:getFace("smallinfofont"),
+        }
+    end
 
+    -- 3. Progress text + percentage
+    local pct_text = string.format("%d%%", math.floor(pct * 100 + 0.5))
+    self.progress_widget = TextWidget:new{
+        text = T(_("Reviewed %1 / %2  ·  %3"), self.reviewed_count, self.total_cards, pct_text),
+        face = Font:getFace("smallinfofont"),
+        fgcolor = Blitbuffer.COLOR_GRAY_6,
+    }
+
+    -- 4. Card metadata subtitle (reps / interval / difficulty)
+    local interval_label = SM20Engine.formatInterval(card.stability)
+    local diff_pct = math.floor((card.difficulty or 0.5) * 100 + 0.5)
+    self.meta_widget = TextWidget:new{
+        text = T(_("Reps: %1  ·  Interval: %2  ·  Diff: %3%%"),
+            tostring(card.repetition or 1), interval_label, tostring(diff_pct)),
+        face = Font:getFace("smallinfofont"),
+        fgcolor = Blitbuffer.COLOR_GRAY_6,
+    }
+
+    -- 5. Card text widget
     local card_text = card.text or ""
     local card_has_cloze = hasCloze(card_text)
     local text_to_display = card_text
     if card_has_cloze then
-        if self.cloze_revealed then
-            text_to_display = revealCloze(card_text)
-        else
-            text_to_display = hideCloze(card_text)
-        end
+        text_to_display = self.cloze_revealed and revealCloze(card_text) or hideCloze(card_text)
     end
 
-    self.text_widget = TextBoxWidget:new{
-        text = text_to_display,
-        face = Font:getFace("infofont"),
-        width = self.dimen.w - Size.padding.fullscreen * 2,
-        height = content_height,
-        scroll = true,
-        scroll_bar_width = Size.padding.small,
-        dialog = self,
-    }
-
-    self.progress_widget = TextWidget:new{
-        text = progress_text,
-        face = Font:getFace("infofont"),
-    }
-
+    -- 6. Buttons — grade row gets predicted intervals + colors; Edit on its own row
     local bottom_buttons
     if card_has_cloze and not self.cloze_revealed then
         bottom_buttons = {
@@ -167,48 +225,49 @@ function QueueView:_buildUI()
                         UIManager:setDirty(self, "full")
                     end,
                 },
+            },
+            {
                 {
                     text = _("Edit"),
                     callback = function()
                         self:onEditCard()
                     end,
                 },
-            }
+            },
         }
     else
+        local preview = self:_computePreviews(card)
         bottom_buttons = {
             {
                 {
-                    text = _("Again"),
-                    callback = function()
-                        self:onGrade("again")
-                    end,
+                    text = T(_("%1 (%2)"), GRADE_LABELS.again, preview.again),
+                    callback = function() self:onGrade("again") end,
+                    color = GRADE_COLORS.again,
                 },
                 {
-                    text = _("Hard"),
-                    callback = function()
-                        self:onGrade("hard")
-                    end,
+                    text = T(_("%1 (%2)"), GRADE_LABELS.hard, preview.hard),
+                    callback = function() self:onGrade("hard") end,
+                    color = GRADE_COLORS.hard,
                 },
                 {
-                    text = _("Good"),
-                    callback = function()
-                        self:onGrade("good")
-                    end,
+                    text = T(_("%1 (%2)"), GRADE_LABELS.good, preview.good),
+                    callback = function() self:onGrade("good") end,
+                    color = GRADE_COLORS.good,
                 },
                 {
-                    text = _("Easy"),
-                    callback = function()
-                        self:onGrade("easy")
-                    end,
+                    text = T(_("%1 (%2)"), GRADE_LABELS.easy, preview.easy),
+                    callback = function() self:onGrade("easy") end,
+                    color = GRADE_COLORS.easy,
                 },
+            },
+            {
                 {
                     text = _("Edit"),
                     callback = function()
                         self:onEditCard()
                     end,
                 },
-            }
+            },
         }
     end
 
@@ -218,18 +277,40 @@ function QueueView:_buildUI()
         show_parent = self,
     }
 
+    -- 7. Compute text-widget height from sibling widget heights (not magic numbers)
+    local used_h = self.title_bar:getHeight()
+        + (self.progress_bar:getSize().h or 0)
+        + (self.progress_widget:getSize().h or 0)
+        + (self.meta_widget:getSize().h or 0)
+        + (button_table:getSize().h or 0)
+        + Size.padding.default * 4
+    local content_height = math.max(Size.item.height_default * 3, self.dimen.h - used_h)
+
+    self.text_widget = TextBoxWidget:new{
+        text = text_to_display,
+        face = Font:getFace("infofont"),
+        width = self.dimen.w - Size.padding.fullscreen * 2,
+        height = content_height,
+        scroll = true,
+        scroll_bar_width = Size.padding.small,
+        dialog = self,
+    }
+
+    -- 8. Layout: title/progress/text/meta stacked at top, buttons pinned to bottom
     local content = VerticalGroup:new{
         align = "center",
         self.title_bar,
+        self.progress_bar,
         self.progress_widget,
         self.text_widget,
+        self.meta_widget,
     }
 
     self[1] = FrameContainer:new{
         height = self.dimen.h,
         padding = 0,
         bordersize = 0,
-        background = require("ffi/blitbuffer").COLOR_WHITE,
+        background = Blitbuffer.COLOR_WHITE,
         OverlapGroup:new{
             dimen = self.dimen,
             content,
@@ -266,6 +347,9 @@ function QueueView:onGrade(grade_name)
         })
 
         self.reviewed_count = self.reviewed_count + 1
+        if self.grade_counts[grade_name] then
+            self.grade_counts[grade_name] = self.grade_counts[grade_name] + 1
+        end
 
         -- Batch flush every 10 reviews
         if #self.pending_reviews >= 10 then
@@ -293,9 +377,7 @@ function QueueView:_advance()
 
     if self.current_idx > self.total_cards then
         self:_flushAndClose()
-        UIManager:show(InfoMessage:new{
-            text = T(_("All done! Reviewed %1 cards."), self.reviewed_count),
-        })
+        self:_showSummary()
         return
     end
 
@@ -317,6 +399,38 @@ function QueueView:_flushAndClose()
         self.pending_reviews = {}
     end
     db:saveIntervalMatrix(self.interval_matrix, self.count_matrix)
+end
+
+-- End-of-session breakdown screen — replaces the old one-line toast.
+function QueueView:_showSummary()
+    local again = self.grade_counts.again
+    local hard  = self.grade_counts.hard
+    local good  = self.grade_counts.good
+    local easy  = self.grade_counts.easy
+    local total = again + hard + good + easy
+    local retained = good + easy
+    local accuracy = total > 0 and math.floor(retained / total * 100 + 0.5) or 0
+
+    if has_keyvaluepage then
+        UIManager:show(KeyValuePage:new{
+            title = _("Session complete"),
+            kv_pairs = {
+                { _("Cards reviewed"), tostring(total) },
+                { _("Accuracy"), string.format("%d%%  (%d of %d remembered)", accuracy, retained, total) },
+                { "--", "--" },
+                { _("Again"), tostring(again) },
+                { _("Hard"),  tostring(hard) },
+                { _("Good"),  tostring(good) },
+                { _("Easy"),  tostring(easy) },
+            },
+            single_page = true,
+        })
+    else
+        UIManager:show(InfoMessage:new{
+            text = T(_("All done! Reviewed %1 cards. Accuracy: %2%%"),
+                tostring(total), tostring(accuracy)),
+        })
+    end
 end
 
 function QueueView:onGoToSource()
@@ -387,6 +501,10 @@ end
 function QueueView:onEditCard()
     local card = self.cards[self.current_idx]
     if not card then return end
+    if not has_inputdialog then
+        UIManager:show(InfoMessage:new{ text = _("Editing not supported on this build.") })
+        return
+    end
 
     local dialog
     dialog = InputDialog:new{

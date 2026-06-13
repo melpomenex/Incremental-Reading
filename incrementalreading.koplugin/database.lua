@@ -220,6 +220,19 @@ function DB:updateCardText(card_id, new_text)
     conn:close()
 end
 
+function DB:setCardSuspended(card_id, suspended)
+    suspended = suspended and 1 or 0
+    local conn = openDB()
+    local stmt = conn:prepare([[
+        UPDATE cards SET suspended = ?
+        WHERE id = ?;
+    ]])
+    stmt:bind(suspended, card_id)
+    stmt:step()
+    stmt:close()
+    conn:close()
+end
+
 function DB:getDueCount()
     local conn = openDB()
     local stmt = conn:prepare([[
@@ -245,7 +258,7 @@ function DB:getAllCards()
     local conn = openDB()
     local stmt = conn:prepare([[
         SELECT id, text, book_title, file_path, xpointer, page, chapter,
-               stability, difficulty, repetition, next_review
+               stability, difficulty, repetition, next_review, suspended
         FROM cards
         ORDER BY book_title ASC, id ASC;
     ]])
@@ -264,6 +277,7 @@ function DB:getAllCards()
             difficulty  = tonumber(row[9]) or 0.5,
             repetition  = tonumber(row[10]) or 1,
             next_review = row[11],
+            suspended   = tonumber(row[12]) == 1,
         })
         row = stmt:step()
     end
@@ -343,15 +357,53 @@ function DB:getStatistics()
     local due_today = row and tonumber(row[1]) or 0
     stmt:close()
     local total_reviews = tonumber(conn:rowexec("SELECT COUNT(*) FROM reviews;")) or 0
-    local avg_interval = tonumber(conn:rowexec([[
-        SELECT COALESCE(AVG(stability), 0) FROM cards WHERE stability > 0;
-    ]])) or 0
+    local avg_interval = tonumber(conn:rowexec(
+        "SELECT COALESCE(AVG(stability), 0) FROM cards WHERE stability > 0;"
+    )) or 0
+
+    local mature_cards = tonumber(conn:rowexec(
+        "SELECT COUNT(*) FROM cards WHERE stability >= 21.0;"
+    )) or 0
+
+    -- Streak: consecutive days (ending today or yesterday) with >= 1 review
+    local streak = 0
+    local rows
+    if conn.exec then
+        rows = conn:exec(
+            "SELECT DISTINCT substr(reviewed_at, 1, 10) AS d FROM reviews ORDER BY d DESC;"
+        )
+    end
+    if rows and rows[1] then
+        local today_str     = os.date("!%Y-%m-%d", os.time())
+        local yesterday_str = os.date("!%Y-%m-%d", os.time() - 86400)
+        local seen = {}
+        for _, d in ipairs(rows[1]) do
+            seen[d] = true
+        end
+        local cursor = today_str
+        if not seen[today_str] then
+            cursor = yesterday_str
+        end
+        while seen[cursor] do
+            streak = streak + 1
+            local y, m, d = cursor:match("^(%d+)-(%d+)-(%d+)$")
+            local prev = os.date("!%Y-%m-%d",
+                os.time({ year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 12 }) - 86400)
+            cursor = prev
+        end
+    end
+
     conn:close()
     return {
         total_cards   = total_cards,
         due_today     = due_today,
         total_reviews = total_reviews,
+        retention     = retention,
         avg_interval  = avg_interval,
+        mature_cards  = mature_cards,
+        due_24h       = due_24h,
+        due_week      = due_week,
+        streak        = streak,
     }
 end
 
