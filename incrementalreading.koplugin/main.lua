@@ -169,7 +169,11 @@ function IncReading:onBrowseCards()
             if card.suspended then
                 badge = _("suspended")
             else
-                badge = SM20Engine.formatInterval(card.stability)
+                -- the canonical scheduled interval (days); stability is the
+                -- M4 memory-stability metric, not the due interval
+                local interval = card.interval_days
+                if not interval or interval == 0 then interval = card.stability end
+                badge = SM20Engine.formatInterval(interval)
             end
             table.insert(items, {
                 text = preview,

@@ -96,7 +96,12 @@ function QueueView:init()
     self.prev_cards = {}
     self.grade_counts = { again = 0, hard = 0, good = 0, easy = 0 }
 
-    self.interval_matrix, self.count_matrix = db:loadIntervalMatrix()
+    local coll_dict = db:loadCollectionState()
+    if coll_dict then
+        self.collection = SM20Engine.collectionFromDict(coll_dict)
+    else
+        self.collection = SM20Engine.newCollectionState()
+    end
 
     if Device:hasKeys() then
         self.key_events.Close = { { Device.input.group.Back } }
@@ -113,13 +118,15 @@ function QueueView:init()
     self:_buildUI()
 end
 
--- Read-only SM-20 preview for each grade. Used to label buttons with the
--- predicted next interval ("Again (1d)", "Good (3d)", etc).
+-- Read-only canonical SM-20 preview for each grade. Used to label buttons with the
+-- predicted next interval ("Again (1d)", "Good (3d)", etc). Never mutates state.
 function QueueView:_computePreviews(card)
     local out = {}
+    local elapsed = SM20Engine.elapsedDays(card)
     for _, grade in ipairs({ "again", "hard", "good", "easy" }) do
         local ok, result = pcall(function()
-            return SM20Engine:preview(card, grade, self.interval_matrix, self.count_matrix)
+            return SM20Engine:preview(card, grade, self.collection,
+                { elapsed_days = elapsed })
         end)
         if ok and result then
             out[grade] = SM20Engine.formatInterval(result.next_review_offset_days)
@@ -195,11 +202,15 @@ function QueueView:_buildUI()
     }
 
     -- 4. Card metadata subtitle (reps / interval / difficulty)
-    local interval_label = SM20Engine.formatInterval(card.stability)
-    local diff_pct = math.floor((card.difficulty or 0.5) * 100 + 0.5)
+    local srs = SM20Engine.decodeCardSRS(card)
+    local interval_value = srs.interval
+    if interval_value == 0 then interval_value = card.interval_days end
+    if interval_value == 0 then interval_value = card.stability end
+    local interval_label = SM20Engine.formatInterval(interval_value)
+    local diff_pct = math.floor((srs.difficulty or 0.5) * 100 + 0.5)
     self.meta_widget = TextWidget:new{
         text = T(_("Reps: %1  ·  Interval: %2  ·  Diff: %3%%"),
-            tostring(card.repetition or 1), interval_label, tostring(diff_pct)),
+            tostring(srs.repetition or 0), interval_label, tostring(diff_pct)),
         face = Font:getFace("smallinfofont"),
         fgcolor = Blitbuffer.COLOR_GRAY_6,
     }
@@ -327,11 +338,10 @@ function QueueView:onGrade(grade_name)
         local card = self.cards[self.current_idx]
         if not card then return end
 
-        local result = SM20Engine:review(card, grade_name, self.interval_matrix, self.count_matrix)
-        SM20Engine:recordIntoMatrix(card, result, self.interval_matrix, self.count_matrix)
+        local result = SM20Engine:review(card, grade_name, self.collection)
 
         local next_review_date = os.date("!%Y-%m-%d %H:%M:%S",
-            math.floor(os.time() + result.next_review_offset_days * 86400))
+            math.floor(result.last_reviewed_at + result.next_review_offset_days * 86400))
 
         table.insert(self.pending_reviews, {
             card_id          = result.card_id,
@@ -343,6 +353,9 @@ function QueueView:onGrade(grade_name)
             elapsed_days     = result.elapsed_days,
             new_difficulty   = result.new_difficulty,
             new_repetition   = result.new_repetition,
+            new_lapses       = result.new_lapses,
+            last_reviewed_at = result.last_reviewed_at,
+            srs_state        = result.srs_state,
             next_review_date = next_review_date,
         })
 
@@ -351,9 +364,10 @@ function QueueView:onGrade(grade_name)
             self.grade_counts[grade_name] = self.grade_counts[grade_name] + 1
         end
 
-        -- Batch flush every 10 reviews
+        -- Batch flush every 10 reviews (card rows + collection state together)
         if #self.pending_reviews >= 10 then
             db:flushReviews(self.pending_reviews)
+            db:saveCollectionState(SM20Engine.collectionToDict(self.collection))
             self.pending_reviews = {}
         end
 
@@ -398,7 +412,9 @@ function QueueView:_flushAndClose()
         db:flushReviews(self.pending_reviews)
         self.pending_reviews = {}
     end
-    db:saveIntervalMatrix(self.interval_matrix, self.count_matrix)
+    if self.collection then
+        db:saveCollectionState(SM20Engine.collectionToDict(self.collection))
+    end
 end
 
 -- End-of-session breakdown screen — replaces the old one-line toast.
